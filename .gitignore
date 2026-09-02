@@ -1,0 +1,11 @@
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
+videos/
+.env
+cookies.txt
+leaderboard.json
+leetcode_users.json
+message.log
+lc_reminders.json
+user.json

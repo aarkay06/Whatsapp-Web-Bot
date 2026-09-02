@@ -1,0 +1,25 @@
+{
+  "name": "whatsapp-web-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop whatsapp-bot",
+    "pm2:restart": "pm2 restart whatsapp-bot",
+    "pm2:logs": "pm2 logs whatsapp-bot",
+    "pm2:status": "pm2 status",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "genius-lyrics": "^4.4.7",
+    "openai": "^6.16.0",
+    "qrcode-terminal": "^0.12.0",
+    "tmdb-ts": "^2.2.0",
+    "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js#main"
+  }
+}
