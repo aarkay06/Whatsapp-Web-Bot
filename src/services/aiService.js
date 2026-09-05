@@ -2,10 +2,12 @@ const fs = require("fs");
 const path = require("path");
 const OpenAI = require("openai");
 
-const openaiClient = new OpenAI({
-  apiKey: process.env.PERPLEXITY_API_KEY,
-  baseURL: "https://api.perplexity.ai",
-});
+const openaiClient = process.env.PERPLEXITY_API_KEY
+  ? new OpenAI({
+      apiKey: process.env.PERPLEXITY_API_KEY,
+      baseURL: "https://api.perplexity.ai",
+    })
+  : null;
 
 // ─── Rate-limit backoff tracker ───────────────────────────────────────────────
 // Prevents hammering a model that just returned 429. Tracks cooldown per model.
@@ -25,6 +27,29 @@ function setModelCooldown(modelId, retryAfterSeconds = 65) {
   const untilMs = Date.now() + retryAfterSeconds * 1000;
   modelCooldowns.set(modelId, { untilMs });
   console.warn(`⏳ ${modelId} rate-limited — cooling down ${retryAfterSeconds}s`);
+}
+
+/**
+ * Strips internal reasoning/chain-of-thought artifacts (e.g. <think> tags,
+ * thinking process preambles) from AI responses so only clean output is sent.
+ */
+function cleanAiResponse(rawText) {
+  if (!rawText) return "";
+  let text = String(rawText).trim();
+
+  // Strip <think>...</think> tags from reasoning models
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+
+  // Strip "Here's a thinking process:" dumps if the model outputs them
+  if (/^Here['’]s a thinking process:/i.test(text)) {
+    const paragraphs = text.split(/\n\s*\n+/);
+    if (paragraphs.length > 1) {
+      // The final section usually contains the actual response
+      text = paragraphs[paragraphs.length - 1].trim();
+    }
+  }
+
+  return text || rawText;
 }
 
 // ─── OpenRouter key reader ────────────────────────────────────────────────────
@@ -55,26 +80,16 @@ function getOpenRouterApiKey() {
 // ─── Gemini model list ────────────────────────────────────────────────────────
 // Ordered by Requests-Per-Day (RPD) quota — highest first so we get the most
 // headroom before rate limits kick in. Lite models have higher RPD quota.
-//
-//  Model                       RPM   RPD
-//  gemini-3.1-flash-lite       15    500   ← try first (most quota)
-//  gemini-3.1-flash-lite-preview 15  500   ← alias
-//  gemini-3.5-flash-lite       15     20
-//  gemini-2.5-flash-lite       10     20
-//  gemini-2.5-flash             5     20
-//  gemini-3-flash-preview       5     20
-//  gemini-3.5-flash             5     20
-//  gemini-3.6-flash             5     20
-// Model IDs verified via ModelService.ListModels on 2026-08-09.
 const GEMINI_MODELS = [
-  "gemini-3.1-flash-lite",       // 500 RPD — highest quota, try first
+  "gemini-3.1-flash-lite",
   "gemini-3.1-flash-lite-preview",
   "gemini-3.5-flash-lite",
-  "gemini-2.5-flash-lite",
-  "gemini-2.5-flash",
   "gemini-3-flash-preview",
   "gemini-3.5-flash",
   "gemini-3.6-flash",
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-lite",
+  "gemini-1.5-flash",
 ];
 
 /**
@@ -82,8 +97,11 @@ const GEMINI_MODELS = [
  * Rotates through models ordered by quota; skips models in cooldown.
  */
 async function callGeminiAPI(systemInstruction, userContent) {
-  const apiKey =
-    process.env.GEMINI_API_KEY || "AIzaSyCr43L9g-GluZB4F0_Pf8pPrBD4YH6XgM4";
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("No Gemini API key configured");
+  }
 
   let lastError = null;
 
@@ -111,6 +129,11 @@ async function callGeminiAPI(systemInstruction, userContent) {
               parts: [{ text: userContent }],
             },
           ],
+          generationConfig: {
+            thinkingConfig: {
+              thinkingBudget: 0,
+            },
+          },
         }),
       });
 
@@ -125,16 +148,28 @@ async function callGeminiAPI(systemInstruction, userContent) {
         continue;
       }
 
+      // If API key is invalid/revoked (401/403), stop immediately instead of looping all models
+      if (response.status === 401 || response.status === 403) {
+        const errorData = await response.text();
+        throw new Error(`Gemini Auth Error (${response.status}): ${errorData}`);
+      }
+
       if (!response.ok) {
         const errorData = await response.text();
         throw new Error(`HTTP ${response.status} — ${model}: ${errorData}`);
       }
 
       const data = await response.json();
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      const parts = data?.candidates?.[0]?.content?.parts || [];
+      const text = parts
+        .filter((p) => !p.thought && p.text)
+        .map((p) => p.text)
+        .join("")
+        .trim();
+
       if (text) {
         console.log(`✅ Gemini responded via ${model}`);
-        return text;
+        return cleanAiResponse(text);
       }
 
       throw new Error(`Empty response from ${model}`);
@@ -143,6 +178,11 @@ async function callGeminiAPI(systemInstruction, userContent) {
         console.warn(`⚠️  Gemini ${model} error:`, err.message);
       }
       lastError = err;
+
+      // If auth failure, don't try other Gemini models with the same bad key
+      if (err.message.includes("Gemini Auth Error")) {
+        break;
+      }
     }
   }
 
@@ -150,16 +190,19 @@ async function callGeminiAPI(systemInstruction, userContent) {
 }
 
 // ─── OpenRouter model list ────────────────────────────────────────────────────
-// Using :free tier models (prompt=$0, completion=$0).
-// Ordered from most capable to lightest for graceful quality degradation.
+// Using active :free tier models (prompt=$0, completion=$0).
+// Ordered by reliability and quality for seamless fallback.
 const OPENROUTER_MODELS = [
-  "google/gemini-2.0-flash-exp:free",
-  "meta-llama/llama-3.3-70b-instruct:free",
-  "mistralai/mistral-small-3.2-24b-instruct:free",
-  "mistralai/mistral-7b-instruct:free",
+  "nvidia/nemotron-3.5-lightning:free",
+  "minimax/minimax-m3:free",
+  "minimax/minimax-m2.7:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "liquid/lfm-2.5-2.6b:free",
+  "cohere/north-mini-code:free",
+  "inclusionai/ling-3.0-flash-sante:free",
+  "inclusionai/ling-3.0-flash-fin:free",
   "poolside/laguna-s-2.1:free",
-  "qwen/qwen3-8b:free",
-  "inclusionai/ling-3.0-tiny:free",
+  "poolside/laguna-xs-2.1:free",
 ];
 
 /**
@@ -216,7 +259,7 @@ async function callOpenRouterAPI(systemInstruction, userContent) {
       const content = data?.choices?.[0]?.message?.content;
       if (content) {
         console.log(`✅ OpenRouter responded via ${model}`);
-        return content;
+        return cleanAiResponse(content);
       }
 
       throw new Error(`Empty response from ${model}`);
@@ -251,7 +294,10 @@ async function analyzeChatContextAndRespond({
   } else {
     historyMessages.forEach((msg, idx) => {
       const sender = msg.author || msg.from || "User";
-      promptContext += `[Message ${idx + 1}] ${sender}: ${msg.body}\n`;
+      let body = typeof msg === "string" ? msg : (msg.body || msg.caption || "");
+      if (!body && msg.type) body = `[${msg.type.toUpperCase()}]`;
+      else if (!body) body = "[Message/Media]";
+      promptContext += `[Message ${idx + 1}] ${sender}: ${body}\n`;
     });
   }
 
@@ -259,7 +305,9 @@ async function analyzeChatContextAndRespond({
     promptContext += `\n=== REPLIED-TO MESSAGE THREAD (Oldest to Newest Ancestor) ===\n`;
     quotedChain.forEach((msg, idx) => {
       const sender = msg.author || msg.from || `User ${idx + 1}`;
-      const body = typeof msg === "string" ? msg : (msg.body || msg.caption || "");
+      let body = typeof msg === "string" ? msg : (msg.body || msg.caption || "");
+      if (!body && msg.type) body = `[${msg.type.toUpperCase()}]`;
+      else if (!body) body = "[Media/Sticker]";
       promptContext += `[Quote Level ${idx + 1}] ${sender}: ${body}\n`;
     });
   } else if (quotedMessageText) {
