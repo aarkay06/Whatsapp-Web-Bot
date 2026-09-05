@@ -74,7 +74,7 @@ function getOpenRouterApiKey() {
   } catch (e) {
     console.warn("Could not read openrouter.txt:", e.message);
   }
-  return "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";
+  return "";
 }
 
 // ─── Gemini model list ────────────────────────────────────────────────────────
@@ -211,6 +211,9 @@ const OPENROUTER_MODELS = [
  */
 async function callOpenRouterAPI(systemInstruction, userContent) {
   const apiKey = getOpenRouterApiKey();
+  if (!apiKey) {
+    throw new Error("No OpenRouter API key configured");
+  }
   const url = "https://openrouter.ai/api/v1/chat/completions";
 
   let lastError = null;
